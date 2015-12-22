@@ -44,7 +44,7 @@
 
 #include <sys/time.h>
 #include <signal.h>
-unsigned int packets;
+unsigned int packets[2][4];
 unsigned long long bytes;
 struct timeval start;
 int seq = -1;
@@ -56,15 +56,24 @@ void int_handler(int signal) {
 	struct timeval end;
 	struct timeval res;
 	double elapsed;
+	unsigned send, ep;
 	
 	gettimeofday(&end, NULL);
-	
+
 	timersub(&end, &start, &res);
 	elapsed = res.tv_sec + (double) res.tv_usec / 1000000.0;
 	
 	printf("\nelapsed: %.6f seconds\n", elapsed);
-	printf("packets: %u\n", packets);
-	printf("packets/sec: %f\n", (double)packets/elapsed);
+	for(send = 0 ; send < 2 ; ++send) {
+		for(ep = 1 ; ep < 5 ; ++ep) {
+			printf("packets: ep%d-%s %u\n",
+					ep, (send?"out":"in"),
+					packets[send][ep-1]);
+			printf("packets/sec: ep%d-%s %f\n",
+					ep, (send?"out":"in"),
+					(double)packets[send][ep-1]/elapsed);
+		}
+	}
 	printf("bytes/sec: %f\n", (double)bytes/elapsed);
 	printf("MBit/sec: %f\n", (double)bytes/elapsed * 8 / 1000000);
 
@@ -73,13 +82,30 @@ void int_handler(int signal) {
 
 static void read_callback(struct libusb_transfer *transfer)
 {
-	int res;
+	int res, i;
 	
-//	printf("Read callback\n");
-	if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
-		unsigned char pkt_seq = transfer->buffer[0];
+	if (transfer->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
+		unsigned send = (transfer->endpoint & 0x80 ? 0 : 1);
+		unsigned ep = (transfer->endpoint & 0xF) - 1;
 
-		packets++;
+		for (i = 0; i < transfer->num_iso_packets; i++) {
+			struct libusb_iso_packet_descriptor *pack = &transfer->iso_packet_desc[i];
+
+			if (pack->status != LIBUSB_TRANSFER_COMPLETED)
+				fprintf(stderr, "Error: pack %u status %d\n", i, pack->status);
+			else {
+				packets[send][ep]++;
+				bytes += pack->actual_length;
+			}
+		}
+	}
+//	printf("Read callback\n");
+	else if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+		unsigned char pkt_seq = transfer->buffer[0];
+		unsigned send = (transfer->endpoint & 0x80 ? 0 : 1);
+		unsigned ep = (transfer->endpoint & 0xF) - 1;
+
+		packets[send][ep]++;
 		bytes += transfer->actual_length;
 		
 		seq = pkt_seq;
@@ -107,35 +133,66 @@ static void read_callback(struct libusb_transfer *transfer)
 }
 
 
-static struct libusb_transfer *create_transfer(libusb_device_handle *handle, size_t length, bool out)
+static struct libusb_transfer *create_transfer(libusb_device_handle *handle, size_t length, bool out, unsigned ep)
 {
 	struct libusb_transfer *transfer;
 	unsigned char *buf;
 
 	/* Set up the transfer object. */
-	buf = calloc(1, length);
-	transfer = libusb_alloc_transfer(0);
-	if (out) {
-		/* Bulk OUT */
-		libusb_fill_bulk_transfer(transfer,
-			handle,
-			0x01 /*ep*/,
-			buf,
-			length,
-			read_callback,
-			NULL/*cb data*/,
-			5000/*timeout*/);
-	}
-	else {
-		/* Bulk IN */
-		libusb_fill_bulk_transfer(transfer,
-			handle,
-			0x81 /*ep*/,
-			buf,
-			length,
-			read_callback,
-			NULL/*cb data*/,
-			5000/*timeout*/);
+	if (ep == 1) { // iso
+		buf = calloc(1, length*16);
+		transfer = libusb_alloc_transfer(16);
+		if (out) {
+			/* ISO OUT */
+			libusb_fill_iso_transfer(transfer,
+				handle,
+				ep & 0xF /*ep*/,
+				buf,
+				length*16,
+				16,
+				read_callback,
+				NULL/*cb data*/,
+				5000/*timeout*/);
+		}
+		else {
+			/* ISO IN */
+			libusb_fill_iso_transfer(transfer,
+				handle,
+				0x80 | (ep & 0xF) /*ep*/,
+				buf,
+				length*16,
+				16,
+				read_callback,
+				NULL/*cb data*/,
+				5000/*timeout*/);
+		}
+		libusb_set_iso_packet_lengths(transfer,
+				length);
+	} else {
+		buf = calloc(1, length);
+		transfer = libusb_alloc_transfer(0);
+		if (out) {
+			/* Bulk OUT */
+			libusb_fill_bulk_transfer(transfer,
+				handle,
+				ep & 0xF /*ep*/,
+				buf,
+				length,
+				read_callback,
+				NULL/*cb data*/,
+				5000/*timeout*/);
+		}
+		else {
+			/* Bulk IN */
+			libusb_fill_bulk_transfer(transfer,
+				handle,
+				0x80 | (ep & 0xF) /*ep*/,
+				buf,
+				length,
+				read_callback,
+				NULL/*cb data*/,
+				5000/*timeout*/);
+		}
 	}
 	return transfer;
 }
@@ -148,12 +205,13 @@ int main(int argc, char **argv)
 	int i;
 	int res = 0;
 	int c;
+	unsigned ep = 1;
 	bool sync = false;
 	bool show_help = false;
 	bool send = false;
 
 	/* Parse options */
-	while ((c = getopt(argc, argv, "siohl:")) > 0) {
+	while ((c = getopt(argc, argv, "siohl:e:")) > 0) {
 		switch (c) {
 		case 's':
 			sync = true;
@@ -170,6 +228,9 @@ int main(int argc, char **argv)
 			break;
 		case 'h':
 			show_help = true;
+			break;
+		case 'e':
+			ep = atoi(optarg);
 			break;
 		default:
 			printf("Invalid option -%c\n", c);
@@ -195,7 +256,8 @@ int main(int argc, char **argv)
 			"\t-l <length>           length of transfer\n"
 			"\t-s                    use synchronous API\n"
 			"\t-o                    test OUT endpoint\n"
-			"\t-h                    show help\n",
+			"\t-h                    show help\n"
+			"\t-e <epnum>            ep num\n",
 			argv[0]);
 		return 1;
 	}
@@ -237,9 +299,22 @@ int main(int argc, char **argv)
 	if (!sync) {
 		/* Asynchronous */
 
-		for (i = 0; i < 32; i++) {
-			struct libusb_transfer *transfer =
-				create_transfer(handle, buflen, send);
+		for (i = 0; i < (ep > 4 ? 512 : 32); i++) {
+			struct libusb_transfer *transfer;
+			bool isend = (i / 16) % 2;
+			unsigned iep = (i % 4) + 1;
+
+			if (iep == 1 || ep == 1)
+				buflen = 1024;
+
+			if (ep > 4) {
+				/*if (iep == 1 && isend)
+					continue;*/
+				printf("%d : ep%d-%s\n", i, iep, (isend?"out":"in"));
+				transfer = create_transfer(handle, buflen, isend, iep);
+			}
+			else
+				transfer = create_transfer(handle, buflen, send, ep);
 			libusb_submit_transfer(transfer);
 		}
 
@@ -282,7 +357,7 @@ int main(int argc, char **argv)
 					return 1;
 				}
 			}
-			packets++;
+			//packets++;
 			bytes += actual_length;
 
 			#if 0
